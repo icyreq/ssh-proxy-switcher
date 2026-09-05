@@ -1,0 +1,10 @@
+[Unit]
+Description=Selectable SSH proxy entry socket
+
+[Socket]
+ListenStream=LISTEN_ENDPOINT
+NoDelay=true
+Service=ssh-proxy-switcher.service
+
+[Install]
+WantedBy=sockets.target

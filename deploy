@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+role=${1:-}
+
+case "$role" in
+  server)
+    shift
+    exec "$project_dir/server/macos/install" "$@"
+    ;;
+  client)
+    shift
+    exec "$project_dir/client/linux-systemd/install" "$@"
+    ;;
+  *)
+    printf 'usage: %s {server|client} [options]\n' "$0" >&2
+    exit 64
+    ;;
+esac

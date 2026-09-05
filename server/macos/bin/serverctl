@@ -1,0 +1,44 @@
+#!/bin/zsh
+set -euo pipefail
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ssh-proxy-switcher/server.env"
+[[ -r "$config_file" ]] || { print -u2 "missing configuration: $config_file"; exit 66; }
+source "$config_file"
+
+user_id=$(/usr/bin/id -u)
+domain="gui/$user_id"
+label="io.ssh-proxy-switcher.server"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+
+loaded() {
+  /bin/launchctl print "$domain/$label" >/dev/null 2>&1
+}
+
+status() {
+  if loaded; then
+    print "launchd: loaded"
+    /bin/launchctl print "$domain/$label" | /usr/bin/awk '
+      /^[[:space:]]*state =/ && !state_seen++ {sub(/^[[:space:]]+/, ""); print}
+      /^[[:space:]]*pid =/ && !pid_seen++ {sub(/^[[:space:]]+/, ""); print}
+    '
+  else
+    print "launchd: stopped"
+  fi
+  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 "$CLIENT_SSH_TARGET" \
+    '$HOME/.local/bin/ssh-proxy' status
+}
+
+case "${1:-}" in
+  status) status ;;
+  start)
+    [[ -f "$plist" ]] || { print -u2 "missing launch agent: $plist"; exit 66; }
+    if loaded; then /bin/launchctl kickstart -k "$domain/$label"; else /bin/launchctl bootstrap "$domain" "$plist"; fi
+    ;;
+  stop) loaded && /bin/launchctl bootout "$domain/$label" || true ;;
+  restart)
+    loaded && /bin/launchctl bootout "$domain/$label" || true
+    /bin/launchctl bootstrap "$domain" "$plist"
+    ;;
+  logs) exec /usr/bin/tail -f "$HOME/Library/Logs/ssh-proxy-switcher/server.log" "$HOME/Library/Logs/ssh-proxy-switcher/server.error.log" ;;
+  *) print -u2 "usage: $0 {status|start|stop|restart|logs}"; exit 64 ;;
+esac

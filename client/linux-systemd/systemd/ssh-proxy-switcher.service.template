@@ -1,0 +1,8 @@
+[Unit]
+Description=Selectable SSH proxy router
+Requires=ssh-proxy-switcher.socket
+After=ssh-proxy-switcher.socket
+
+[Service]
+ExecStart=SOCKET_PROXYD_PATH %h/.local/state/ssh-proxy-switcher/run/active.sock
+NoNewPrivileges=true

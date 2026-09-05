@@ -1,0 +1,40 @@
+#!/bin/zsh
+set -euo pipefail
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ssh-proxy-switcher/server.env"
+if [[ ! -r "$config_file" ]]; then
+  print -u2 "missing configuration: $config_file"
+  exit 66
+fi
+source "$config_file"
+
+if [[ ! "$SERVER_NAME" =~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$' ]]; then
+  print -u2 "invalid SERVER_NAME: $SERVER_NAME"
+  exit 64
+fi
+if [[ ! "$LOCAL_PROXY_PORT" =~ '^[0-9]+$' ]] || (( LOCAL_PROXY_PORT < 1 || LOCAL_PROXY_PORT > 65535 )); then
+  print -u2 "invalid LOCAL_PROXY_PORT: $LOCAL_PROXY_PORT"
+  exit 64
+fi
+if ! /usr/bin/nc -z -w 3 "$LOCAL_PROXY_HOST" "$LOCAL_PROXY_PORT"; then
+  print -u2 "local proxy is not listening at $LOCAL_PROXY_HOST:$LOCAL_PROXY_PORT"
+  exit 69
+fi
+
+remote_socket=$(
+  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 "$CLIENT_SSH_TARGET" \
+    '$HOME/.local/bin/ssh-proxy' register "$SERVER_NAME"
+)
+if [[ "$remote_socket" != /*.sock ]] || [[ "$remote_socket" == *$'\n'* ]]; then
+  print -u2 "client returned an invalid provider socket path"
+  exit 70
+fi
+
+exec /usr/bin/ssh -NT \
+  -o BatchMode=yes \
+  -o ConnectTimeout=15 \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -R "$remote_socket:$LOCAL_PROXY_HOST:$LOCAL_PROXY_PORT" \
+  "$CLIENT_SSH_TARGET"

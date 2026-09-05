@@ -1,0 +1,93 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $(uname -s) != Darwin ]]; then
+  printf 'server deployment currently supports macOS only\n' >&2
+  exit 69
+fi
+
+role_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ssh-proxy-switcher"
+config_file="$config_dir/server.env"
+libexec_dir="$HOME/.local/libexec/ssh-proxy-switcher/server"
+bin_dir="$HOME/.local/bin"
+agent_dir="$HOME/Library/LaunchAgents"
+log_dir="$HOME/Library/Logs/ssh-proxy-switcher"
+label=io.ssh-proxy-switcher.server
+plist="$agent_dir/$label.plist"
+
+server_name=
+proxy_host=127.0.0.1
+proxy_port=
+ssh_target=
+if [[ -r "$config_file" ]]; then
+  source "$config_file"
+  server_name=${SERVER_NAME:-}
+  proxy_host=${LOCAL_PROXY_HOST:-127.0.0.1}
+  proxy_port=${LOCAL_PROXY_PORT:-}
+  ssh_target=${CLIENT_SSH_TARGET:-}
+fi
+
+while (($#)); do
+  case "$1" in
+    --name) server_name=$2; shift 2 ;;
+    --target) ssh_target=$2; shift 2 ;;
+    --proxy-host) proxy_host=$2; shift 2 ;;
+    --proxy-port) proxy_port=$2; shift 2 ;;
+    *) printf 'unknown server option: %s\n' "$1" >&2; exit 64 ;;
+  esac
+done
+
+[[ "$server_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$ ]] || { printf 'missing or invalid --name\n' >&2; exit 64; }
+[[ -n "$ssh_target" ]] || { printf 'missing --target\n' >&2; exit 64; }
+[[ "$proxy_port" =~ ^[0-9]+$ ]] && ((proxy_port >= 1 && proxy_port <= 65535)) || { printf 'missing or invalid --proxy-port\n' >&2; exit 64; }
+/usr/bin/nc -z -w 3 "$proxy_host" "$proxy_port" || { printf 'local proxy is not listening at %s:%s\n' "$proxy_host" "$proxy_port" >&2; exit 69; }
+/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 "$ssh_target" true
+
+mkdir -p "$config_dir" "$libexec_dir" "$bin_dir" "$agent_dir" "$log_dir"
+umask 077
+{
+  printf 'SERVER_NAME=%q\n' "$server_name"
+  printf 'LOCAL_PROXY_HOST=%q\n' "$proxy_host"
+  printf 'LOCAL_PROXY_PORT=%q\n' "$proxy_port"
+  printf 'CLIENT_SSH_TARGET=%q\n' "$ssh_target"
+} > "$config_file"
+
+cp "$role_dir/macos/bin/tunnel-agent" "$libexec_dir/tunnel-agent"
+cp "$role_dir/macos/bin/serverctl" "$bin_dir/ssh-proxy-server"
+chmod 755 "$libexec_dir/tunnel-agent" "$bin_dir/ssh-proxy-server"
+
+cat > "$config_dir/server-shell.sh" <<'EOF'
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+if [[ ! -f "$HOME/.zprofile" ]]; then
+  touch "$HOME/.zprofile"
+fi
+if ! grep -Fq '# >>> ssh-proxy-switcher server >>>' "$HOME/.zprofile"; then
+  cat >> "$HOME/.zprofile" <<'EOF'
+
+# >>> ssh-proxy-switcher server >>>
+if [ -r "$HOME/.config/ssh-proxy-switcher/server-shell.sh" ]; then
+  . "$HOME/.config/ssh-proxy-switcher/server-shell.sh"
+fi
+# <<< ssh-proxy-switcher server <<<
+EOF
+fi
+
+temporary_plist=$(mktemp "$agent_dir/.ssh-proxy-switcher.XXXXXX")
+trap 'rm -f "$temporary_plist"' EXIT HUP INT TERM
+cp "$role_dir/macos/launchd/server.plist.template" "$temporary_plist"
+plutil -replace ProgramArguments.0 -string "$libexec_dir/tunnel-agent" "$temporary_plist"
+plutil -replace StandardOutPath -string "$log_dir/server.log" "$temporary_plist"
+plutil -replace StandardErrorPath -string "$log_dir/server.error.log" "$temporary_plist"
+plutil -lint "$temporary_plist" >/dev/null
+
+domain="gui/$(id -u)"
+launchctl print "$domain/$label" >/dev/null 2>&1 && launchctl bootout "$domain/$label"
+mv "$temporary_plist" "$plist"
+trap - EXIT HUP INT TERM
+launchctl bootstrap "$domain" "$plist"
+printf 'server deployed: %s\n' "$server_name"

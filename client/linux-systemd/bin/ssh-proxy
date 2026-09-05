@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Register, inspect, test, and explicitly select proxy-server tunnels."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import sys
+import uuid
+
+
+STATE_DIR = Path.home() / ".local" / "state" / "ssh-proxy-switcher"
+RUN_DIR = STATE_DIR / "run"
+PROVIDERS_DIR = RUN_DIR / "providers"
+REGISTRY_DIR = STATE_DIR / "providers.d"
+ACTIVE_LINK = RUN_DIR / "active.sock"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
+PROBE_HOST = "www.google.com"
+PROBE_PORT = 443
+
+
+class ProxyError(RuntimeError):
+    pass
+
+
+def ensure_layout() -> None:
+    for directory in (STATE_DIR, RUN_DIR, PROVIDERS_DIR, REGISTRY_DIR):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+
+
+def validate_name(name: str) -> str:
+    if not NAME_RE.fullmatch(name):
+        raise ProxyError("server name must match [A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+    return name
+
+
+def provider_socket(name: str) -> Path:
+    return PROVIDERS_DIR / f"{validate_name(name)}.sock"
+
+
+def registry_file(name: str) -> Path:
+    return REGISTRY_DIR / f"{validate_name(name)}.json"
+
+
+def registered_names() -> list[str]:
+    return sorted(item.stem for item in REGISTRY_DIR.glob("*.json") if NAME_RE.fullmatch(item.stem))
+
+
+def active_name() -> str | None:
+    if not ACTIVE_LINK.is_symlink():
+        return None
+    target = os.readlink(ACTIVE_LINK)
+    match = re.fullmatch(r"providers/([A-Za-z0-9][A-Za-z0-9._-]{0,47})\.sock", target)
+    return match.group(1) if match else None
+
+
+def socket_is_live(name: str, timeout: float = 0.7) -> bool:
+    path = provider_socket(name)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISSOCK(mode):
+        return False
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+
+def probe(name: str, timeout: float = 8.0) -> str:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(str(provider_socket(name)))
+        request = (
+            f"CONNECT {PROBE_HOST}:{PROBE_PORT} HTTP/1.1\r\n"
+            f"Host: {PROBE_HOST}:{PROBE_PORT}\r\n"
+            "Proxy-Connection: close\r\n\r\n"
+        ).encode("ascii")
+        client.sendall(request)
+        response = bytearray()
+        while b"\r\n" not in response and len(response) < 16384:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        first_line = bytes(response).split(b"\r\n", 1)[0].decode("ascii", "replace")
+        fields = first_line.split()
+        if len(fields) < 2 or fields[1] != "200":
+            raise ProxyError(f"HTTP CONNECT probe failed: {first_line or 'no response'}")
+        return first_line
+    except (OSError, TimeoutError) as exc:
+        raise ProxyError(f"server {name!r} is unavailable: {exc}") from exc
+    finally:
+        client.close()
+
+
+def command_register(name: str) -> None:
+    name = validate_name(name)
+    ensure_layout()
+    path = provider_socket(name)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        mode = 0
+    if mode and not stat.S_ISSOCK(mode):
+        raise ProxyError(f"provider path is not a Unix socket: {path}")
+    if stat.S_ISSOCK(mode) and not socket_is_live(name):
+        path.unlink()
+
+    payload = {"name": name, "last_registered_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+    destination = registry_file(name)
+    temporary = REGISTRY_DIR / f".{name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    print(path)
+
+
+def command_list() -> None:
+    ensure_layout()
+    selected = active_name()
+    names = registered_names()
+    if not names:
+        print("no servers registered")
+        return
+    print(f"{'NAME':<50} {'TUNNEL':<8} ACTIVE")
+    for name in names:
+        state = "online" if socket_is_live(name) else "offline"
+        marker = "*" if name == selected else ""
+        print(f"{name:<50} {state:<8} {marker}")
+
+
+def command_use(name: str) -> None:
+    name = validate_name(name)
+    ensure_layout()
+    if not registry_file(name).is_file():
+        raise ProxyError(f"server {name!r} is not registered")
+    result = probe(name)
+    temporary = RUN_DIR / f".active.{uuid.uuid4().hex}.sock"
+    try:
+        os.symlink(f"providers/{name}.sock", temporary)
+        os.replace(temporary, ACTIVE_LINK)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+    print(f"active: {name}")
+    print(f"probe: {result}")
+
+
+def command_status() -> None:
+    ensure_layout()
+    selected = active_name()
+    if selected is None:
+        print("active: none")
+        return
+    state = "online" if socket_is_live(selected) else "offline"
+    print(f"active: {selected} ({state})")
+
+
+def command_test(name: str | None) -> None:
+    ensure_layout()
+    selected = validate_name(name) if name else active_name()
+    if selected is None:
+        raise ProxyError("no active server")
+    result = probe(selected)
+    print(f"server: {selected}")
+    print(f"probe: {result}")
+
+
+def command_forget(name: str) -> None:
+    name = validate_name(name)
+    ensure_layout()
+    if active_name() == name:
+        raise ProxyError("cannot forget the active server; select another first")
+    if socket_is_live(name):
+        raise ProxyError("cannot forget an online server; stop its tunnel first")
+    registry_file(name).unlink(missing_ok=True)
+    path = provider_socket(name)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        mode = 0
+    if stat.S_ISSOCK(mode):
+        path.unlink()
+    print(f"forgotten: {name}")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="ssh-proxy")
+    commands = root.add_subparsers(dest="command", required=True)
+    register = commands.add_parser("register")
+    register.add_argument("name")
+    commands.add_parser("list")
+    use = commands.add_parser("use")
+    use.add_argument("name")
+    commands.add_parser("status")
+    test = commands.add_parser("test")
+    test.add_argument("name", nargs="?")
+    forget = commands.add_parser("forget")
+    forget.add_argument("name")
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "register":
+            command_register(args.name)
+        elif args.command == "list":
+            command_list()
+        elif args.command == "use":
+            command_use(args.name)
+        elif args.command == "status":
+            command_status()
+        elif args.command == "test":
+            command_test(args.name)
+        elif args.command == "forget":
+            command_forget(args.name)
+        else:
+            raise AssertionError(args.command)
+        return 0
+    except ProxyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $(uname -s) != Linux ]]; then
+  printf 'client deployment currently supports Linux only\n' >&2
+  exit 69
+fi
+
+role_dir=$(cd -- "$(dirname -- "$0")/.." && pwd)
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ssh-proxy-switcher"
+config_file="$config_dir/client.env"
+state_dir="$HOME/.local/state/ssh-proxy-switcher"
+bin_dir="$HOME/.local/bin"
+unit_dir="$HOME/.config/systemd/user"
+
+listen_host=127.0.0.1
+listen_port=17900
+if [[ -r "$config_file" ]]; then
+  source "$config_file"
+  listen_host=${LISTEN_HOST:-127.0.0.1}
+  listen_port=${LISTEN_PORT:-17900}
+fi
+
+while (($#)); do
+  case "$1" in
+    --listen-host) listen_host=$2; shift 2 ;;
+    --listen-port) listen_port=$2; shift 2 ;;
+    *) printf 'unknown client option: %s\n' "$1" >&2; exit 64 ;;
+  esac
+done
+
+[[ "$listen_port" =~ ^[0-9]+$ ]] && ((listen_port >= 1 && listen_port <= 65535)) || { printf 'invalid --listen-port\n' >&2; exit 64; }
+[[ "$listen_host" == 127.0.0.1 ]] || { printf 'only loopback 127.0.0.1 is accepted by this deployment\n' >&2; exit 64; }
+systemctl --user is-system-running >/dev/null 2>&1 || { printf 'user systemd is not running\n' >&2; exit 69; }
+
+socket_proxyd=
+for candidate in /usr/lib/systemd/systemd-socket-proxyd /lib/systemd/systemd-socket-proxyd /usr/libexec/systemd/systemd-socket-proxyd; do
+  if [[ -x "$candidate" ]]; then socket_proxyd=$candidate; break; fi
+done
+[[ -n "$socket_proxyd" ]] || { printf 'systemd-socket-proxyd is unavailable\n' >&2; exit 69; }
+
+mkdir -p "$config_dir" "$state_dir/run/providers" "$state_dir/providers.d" "$bin_dir" "$unit_dir"
+chmod 700 "$config_dir" "$state_dir" "$state_dir/run" "$state_dir/run/providers" "$state_dir/providers.d"
+umask 077
+{
+  printf 'LISTEN_HOST=%q\n' "$listen_host"
+  printf 'LISTEN_PORT=%q\n' "$listen_port"
+} > "$config_file"
+cat > "$config_dir/env.sh" <<EOF
+case ":\$PATH:" in
+  *":\$HOME/.local/bin:"*) ;;
+  *) export PATH="\$HOME/.local/bin:\$PATH" ;;
+esac
+export http_proxy=http://$listen_host:$listen_port
+export https_proxy=http://$listen_host:$listen_port
+export HTTP_PROXY=http://$listen_host:$listen_port
+export HTTPS_PROXY=http://$listen_host:$listen_port
+export all_proxy=socks5h://$listen_host:$listen_port
+export ALL_PROXY=socks5h://$listen_host:$listen_port
+export no_proxy=localhost,127.0.0.1,::1
+export NO_PROXY=localhost,127.0.0.1,::1
+EOF
+
+cp "$role_dir/linux-systemd/bin/ssh-proxy" "$bin_dir/ssh-proxy"
+chmod 755 "$bin_dir/ssh-proxy"
+sed "s|LISTEN_ENDPOINT|$listen_host:$listen_port|g" "$role_dir/linux-systemd/systemd/ssh-proxy-switcher.socket.template" > "$unit_dir/ssh-proxy-switcher.socket"
+sed "s|SOCKET_PROXYD_PATH|$socket_proxyd|g" "$role_dir/linux-systemd/systemd/ssh-proxy-switcher.service.template" > "$unit_dir/ssh-proxy-switcher.service"
+
+install_shell_hook() {
+  local shell_file=$1
+  [[ -f "$shell_file" ]] || return 0
+  if ! grep -Fq '# >>> ssh-proxy-switcher >>>' "$shell_file"; then
+    cat >> "$shell_file" <<'EOF'
+
+# >>> ssh-proxy-switcher >>>
+if [ -r "$HOME/.config/ssh-proxy-switcher/env.sh" ]; then
+  . "$HOME/.config/ssh-proxy-switcher/env.sh"
+fi
+# <<< ssh-proxy-switcher <<<
+EOF
+  fi
+}
+install_shell_hook "$HOME/.bashrc"
+install_shell_hook "$HOME/.zshrc"
+
+systemctl --user daemon-reload
+systemctl --user enable --now ssh-proxy-switcher.socket
+printf 'client deployed: http://%s:%s\n' "$listen_host" "$listen_port"

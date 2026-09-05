@@ -1,0 +1,6 @@
+./deploy server
+./deploy client
+ssh-proxy-server status
+ssh-proxy list
+ssh-proxy use NAME
+ssh-proxy test
