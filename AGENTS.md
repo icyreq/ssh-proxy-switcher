@@ -66,3 +66,5 @@ Rerun `deploy` after pulling source updates. Installers are idempotent and prese
 ## Current protocol
 
 The server asks the client CLI to register its name. Registration returns the absolute provider socket path. The server then runs a dedicated `ssh -NT -R remote_socket:local_proxy_host:local_proxy_port` process with SSH keepalives. The client has a stable loopback TCP socket forwarded by `systemd-socket-proxyd` to `active.sock`. See `docs/ARCHITECTURE.md` before changing this protocol.
+
+This repository is published publicly on GitHub. Be careful not to expose personal information in the code.
