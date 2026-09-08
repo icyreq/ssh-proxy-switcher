@@ -67,4 +67,6 @@ Rerun `deploy` after pulling source updates. Installers are idempotent and prese
 
 The server asks the client CLI to register its name. Registration returns the absolute provider socket path. The server then runs a dedicated `ssh -NT -R remote_socket:local_proxy_host:local_proxy_port` process with SSH keepalives. The client has a stable loopback TCP socket forwarded by `systemd-socket-proxyd` to `active.sock`. See `docs/ARCHITECTURE.md` before changing this protocol.
 
+OpenSSH does not use HTTP proxy environment variables; configure `ProxyCommand` explicitly when SSH must use this proxy. When troubleshooting SSH, check the effective SSH command/configuration and the configured client proxy endpoint.
+
 This repository is published publicly on GitHub. Be careful not to expose personal information in the code.
